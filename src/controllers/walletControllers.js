@@ -3,6 +3,7 @@ import ColdStorage from "../models/coldstorageModel";
 import { ethers } from "ethers";
 import Web3 from "web3";
 import bcrypt from "bcryptjs";
+import { encryptPrivateKey, decryptPrivateKey } from "../utils/encryption";
 
 // Ethereum provider (Infura or any other RPC provider)
 const provider = new ethers.providers.JsonRpcProvider(
@@ -20,34 +21,22 @@ export const generateWallet = async (req, res, next) => {
   }
 
   try {
-    // Fetch the centralized cold storage wallet from DB
-    const coldStorage = await ColdStorage.findOne();
-    if (!coldStorage) {
-      return res.status(500).json({
-        status: "failed",
-        message: "Cold storage wallet not found",
-      });
-    }
-
-    // Decrypt the cold storage private key
-    const isValid = await bcrypt.compare(process.env.COLD_STORAGE_SECRET, coldStorage.coldStorageKey);
-    if (!isValid) {
-      return res.status(500).json({
-        status: "failed",
-        message: "Invalid decryption key",
-      });
-    }
-
-    // Generate user-specific deposit address using HD Wallet (BIP-44)
-    const masterWallet = new ethers.Wallet(coldStorage.privateKey, provider);
-    const userWallet = masterWallet.derivePath(`m/44'/60'/0'/0/${user_id}`);
-    const walletAddress = userWallet.address;
-
+    const wallet = ethers.Wallet.createRandom();
+    const walletAddress = wallet.address;
     // Save wallet address for the user
     const newWallet = await Wallet.create({
       userId: user_id,
       walletAddress,
       balance: 0, // Starts with zero balance
+    });
+    const privateKey = wallet.privateKey;
+    console.log(privateKey);
+    const encryptedPrivateKey = encryptPrivateKey(privateKey);
+    const newcoldStorage = await ColdStorage.create({
+      currency: "ETH",
+      balance: 0,
+      walletAddress: walletAddress,
+      coldStorageKey: encryptedPrivateKey,
     });
 
     return res.status(200).json({
@@ -55,98 +44,175 @@ export const generateWallet = async (req, res, next) => {
       message: "Wallet created successfully",
       data: {
         userId: newWallet.userId,
-        walletAddress: newWallet.walletAddress,
+        walletAddress: walletAddress,
       },
     });
   } catch (error) {
     return res.status(500).json({
       status: "failed",
-      message: "Failed to create wallet",
+      message: "Failed to generate wallet",
       error: error.message,
     });
   }
 };
 export const withdrawFromWallet = async (req, res) => {
   const { userId, amount, toAddress } = req.body;
+
   if (!userId || !amount || !toAddress) {
-    return res.status(400).json({ status: "failed", message: "Invalid parameters" });
+    return res
+      .status(400)
+      .json({ status: "failed", message: "Invalid parameters" });
   }
-  const wallet = await Wallet.findOne({ where: { userId } });
-  if (!wallet || parseFloat(wallet.balance) < parseFloat(amount)) {
-    return res.status(400).json({ status: "failed", message: "Insufficient balance" });
-  }
-  const coldStorage = await ColdStorage.findOne();
-  if (!coldStorage) {
-    return res.status(500).json({ status: "failed", message: "Cold storage wallet not found" });
-  }
+
   try {
-    const provider = new ethers.providers.JsonRpcProvider("https://ropsten.infura.io/v3/YOUR_INFURA_KEY");
-    const masterWallet = new ethers.Wallet(decryptPrivateKey(coldStorage.encryptedPrivateKey), provider);
+    // Fetch the user's wallet
+    const wallet = await Wallet.findOne({ where: { userId } });
+    if (!wallet) {
+      return res
+        .status(404)
+        .json({ status: "failed", message: "User wallet not found" });
+    }
+
+    // Check if balance is sufficient
+    if (parseFloat(wallet.balance) < parseFloat(amount)) {
+      return res
+        .status(400)
+        .json({ status: "failed", message: "Insufficient balance" });
+    }
+
+    // Fetch the corresponding cold storage wallet for the user
+    const coldStorage = await ColdStorage.findOne({
+      where: { userId, walletAddress: wallet.walletAddress },
+    });
+    if (!coldStorage) {
+      return res
+        .status(500)
+        .json({ status: "failed", message: "Cold storage wallet not found" });
+    }
+
+    // Initialize provider and wallet with decrypted private key
+    const provider = new ethers.providers.JsonRpcProvider(
+      "https://ropsten.infura.io/v3/YOUR_INFURA_KEY"
+    );
+    const decryptedPrivateKey = decryptPrivateKey(coldStorage.coldStorageKey);
+
+    if (!decryptedPrivateKey) {
+      return res
+        .status(500)
+        .json({ status: "failed", message: "Failed to decrypt private key" });
+    }
+
+    const masterWallet = new ethers.Wallet(decryptedPrivateKey, provider);
+
+    // Create and send the transaction
     const tx = await masterWallet.sendTransaction({
       to: toAddress,
       value: ethers.utils.parseEther(amount.toString()),
     });
+
     await tx.wait();
+
+    // Update wallet balance
     wallet.balance = parseFloat(wallet.balance) - parseFloat(amount);
     await wallet.save();
+
     return res.status(200).json({
       status: "success",
       message: "Withdrawal successful",
       transactionHash: tx.hash,
     });
   } catch (error) {
-    return res.status(500).json({ status: "failed", message: "Withdrawal failed", error: error.message });
+    return res.status(500).json({
+      status: "failed",
+      message: "Withdrawal failed",
+      error: error.message,
+    });
   }
-};
-
-const decryptPrivateKey = (encryptedKey) => {
-  return bcrypt.compareSync("your_secret_key", encryptedKey)
-    ? "decrypted_private_key"
-    : null;
 };
 
 export const checkDeposits = async () => {
   try {
-    const provider = new ethers.providers.JsonRpcProvider("https://ropsten.infura.io/v3/YOUR_INFURA_KEY");
+    const provider = new ethers.providers.JsonRpcProvider(
+      "https://ropsten.infura.io/v3/YOUR_INFURA_KEY"
+    );
+
+    // Fetch all wallets
     const wallets = await Wallet.findAll();
+    if (!wallets.length) {
+      console.log("No wallets found.");
+      return;
+    }
+
+    // Fetch cold storage wallet once
+    const coldStorage = await ColdStorage.findOne();
+    if (!coldStorage) {
+      console.error("Cold storage wallet not found.");
+      return;
+    }
+
+    // Decrypt the private key securely
+    const decryptedPrivateKey = decryptPrivateKey(coldStorage.coldStorageKey);
+    if (!decryptedPrivateKey) {
+      console.error("Failed to decrypt cold storage private key.");
+      return;
+    }
+
+    const masterWallet = new ethers.Wallet(decryptedPrivateKey, provider);
 
     for (const wallet of wallets) {
+      if (!wallet.depositAddress) {
+        console.warn(
+          `Wallet for user ${wallet.userId} has no deposit address.`
+        );
+        continue;
+      }
+
       const depositAddress = wallet.depositAddress;
       const balanceWei = await provider.getBalance(depositAddress);
       const balanceETH = ethers.utils.formatEther(balanceWei);
 
       if (parseFloat(balanceETH) > 0) {
-        console.log(`Deposit detected: ${balanceETH} ETH for ${depositAddress}`);
-        const coldStorage = await ColdStorage.findOne();
-        if (!coldStorage) continue;
-
-        const masterWallet = new ethers.Wallet(
-          decryptPrivateKey(coldStorage.encryptedPrivateKey),
-          provider
+        console.log(
+          `Deposit detected: ${balanceETH} ETH for ${depositAddress}`
         );
 
-        const tx = await masterWallet.sendTransaction({
-          to: coldStorage.masterWalletAddress,
-          value: balanceWei,
-        });
+        try {
+          // Transfer funds to cold storage
+          const tx = await masterWallet.sendTransaction({
+            to: coldStorage.masterWalletAddress,
+            value: balanceWei,
+          });
 
-        await tx.wait();
-        wallet.balance = parseFloat(wallet.balance) + parseFloat(balanceETH);
-        await wallet.save();
+          await tx.wait();
+
+          // Update wallet balance
+          wallet.balance = parseFloat(wallet.balance) + parseFloat(balanceETH);
+          await wallet.save();
+
+          console.log(`Funds transferred: ${balanceETH} ETH to cold storage.`);
+        } catch (txError) {
+          console.error(`Transaction failed for ${depositAddress}:`, txError);
+        }
       }
     }
   } catch (error) {
     console.error("Error checking deposits:", error);
   }
 };
+
 export const getBalance = async (req, res) => {
   const { userId } = req.params;
   if (!userId) {
-    return res.status(400).json({ status: "failed", message: "Invalid parameter" });
+    return res
+      .status(400)
+      .json({ status: "failed", message: "Invalid parameter" });
   }
+  const checkDeposits = await checkDeposits();
   const wallet = await Wallet.findOne({ where: { userId } });
   if (!wallet) {
-    return res.status(404).json({ status: "failed", message: "Wallet not found" });
+    return res
+      .status(404)
+      .json({ status: "failed", message: "Wallet not found" });
   }
   return res.status(200).json({
     status: "success",
@@ -156,4 +222,3 @@ export const getBalance = async (req, res) => {
     },
   });
 };
-
